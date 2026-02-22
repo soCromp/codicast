@@ -109,8 +109,28 @@ for sid, sid_in_id in tqdm(zip(sids, sorted(os.listdir(inpath))), total=len(sids
         siddf = tracks[tracks['sid']==sid]
         os.makedirs(os.path.join(outpath_patches, sid), exist_ok=True)
         
+        # Initialize tracking center with ground truth for T=0
+        lat_center, lon_center = siddf.iloc[0]['lat'], siddf.iloc[0]['lon'] % 360
+        search_radius = 10.0 # ~1100 km radius for tracking
+        
+        synth_track = [(lat_center, lon_center)]
+        
         for t in range(timesteps):
-                lat_center, lon_center = siddf.iloc[t]['lat'], siddf.iloc[t]['lon']
+                if t>0:
+                        # LAZY TRACKER: Find local minimum SLP in the predicted drift area
+                        slp_search = ds['slp'].isel(time=t).sel(
+                                lat=slice(lat_center - search_radius, lat_center + search_radius),
+                                lon=slice(lon_center - search_radius, lon_center + search_radius)
+                        )
+                        # Find the index of the minimum SLP
+                        if slp_search.size > 0: # Ensure the box didn't fall off the map
+                                # Get 2D index of minimum value
+                                min_idx = np.unravel_index(slp_search.argmin().values, slp_search.shape)
+                                lat_center = slp_search.lat[min_idx[0]].values.item()
+                                lon_center = slp_search.lon[min_idx[1]].values.item()
+                        synth_track.append((lat_center, lon_center))
+                
+                
                 # NOTE LATITUDE WE MADE NEGATIVE SINCE CODICAST OUTS ARE NORTH/SOUTH FLIPPED
                 # 'aeqd': https://proj.org/en/stable/operations/projections/aeqd.html
                 proj_km = Proj(proj='aeqd', lat_0=lat_center, lon_0=lon_center, units='km')
@@ -143,6 +163,11 @@ for sid, sid_in_id in tqdm(zip(sids, sorted(os.listdir(inpath))), total=len(sids
                 
                 # print(interp_values.shape)
                 np.save(os.path.join(outpath_patches, sid, f'{t}.npy'), interp_values)
+                
+        with open(os.path.join(outpath_patches, sid, 'track.csv'), 'w') as f:
+                f.write('t,lat,lon\n')
+                for t, (lat, lon) in enumerate(synth_track):
+                        f.write(f'{t},{lat},{lon}\n')
         
         
         
