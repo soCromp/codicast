@@ -23,12 +23,22 @@ if module_path not in sys.path:
 # %%
 import os
 os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+from tqdm import tqdm
+
+# # Enable memory growth to stop TF from hoarding VRAM
+# gpus = tf.config.list_physical_devices('GPU')
+# if gpus:
+#     try:
+#         for gpu in gpus:
+#             tf.config.experimental.set_memory_growth(gpu, True)
+#     except RuntimeError as e:
+#         print(e)
 
 # %% [markdown]
 # ## Hyperparameters
 
 # %%
-batch_size = 256
+batch_size = 1024
 num_epochs = 800         # Just for the sake of demonstration
 total_timesteps = 750   # 1000
 norm_groups = 8          # Number of groups used in GroupNormalization layer
@@ -253,7 +263,7 @@ model = DiffusionModel(
 
 # %%
 ## -------------------- ablation study --------------------
-model.load_weights('../checkpoints/ddpm_weather_56c2_56_multivar_cp3')  # CoDiCast with 1000 steps
+model.load_weights('/mnt/data/sonia/codicast-out/date/multivar/checkpoints/ddpm2_weather_56c2_56_multivar_cp3')  # CoDiCast with 1000 steps
 # model.load_weights('../checkpoints/ddpm_weather_56c2_56_5var_cp3_no_cross_attn')
 # model.load_weights('../checkpoints/ddpm_weather_56c2_56_5var_cp3_no_encoder')
 # model.load_weights('../checkpoints/ddpm_weather_56c2_56_5var_cp3_no_cross_attn_encoder')
@@ -273,7 +283,7 @@ resolution_folder = '56degree'
 resolution = '5.625'  
 var_num = '5'
 
-output_folder = '/mnt/data/sonia/codicast-out/date/multivar/test'
+output_folder = '/mnt/data/sonia/codicast-out/date/multivar/raw-out2/test'
 
 # test_data_tf = np.load("/mnt/data/sonia/codicast-data/default/concat_2017_2018_" + resolution + "_" + var_num + "var.npy")
 test_data_tf = np.load("/mnt/data/sonia/codicast-data/multivar/concat_2016_2024_" + resolution + "_" + var_num + "var.npy")
@@ -320,9 +330,8 @@ def generate_images(model, original_samples, original_samples_past1, original_sa
     # 2. Sample from the model iteratively
     for t in reversed(range(0, total_timesteps)):
         tt = tf.cast(tf.fill([num_images], t), dtype=tf.int64)
-        pred_noise = model.ema_network.predict([samples, tt, original_samples_past1, original_samples_past2],
-                                               verbose=0, 
-                                               batch_size=num_images
+        pred_noise = model.ema_network([samples, tt, original_samples_past1, original_samples_past2],
+                                               training=False
                                               )
         samples = model.gdf_util.p_sample(pred_noise, samples, tt, clip_denoised=True)
         
@@ -331,28 +340,49 @@ def generate_images(model, original_samples, original_samples_past1, original_sa
     # return original_samples.numpy(), samples.numpy()
 
 # %%
-def predict_autoregressive(model, initial_inputs, prediction_horizon):
+# def predict_autoregressive(model, initial_inputs, prediction_horizon):
     
+#     predictions = []
+    
+#     original_sample, sample_past1, sample_past2 = initial_inputs[0], initial_inputs[1], initial_inputs[2]  # t, t-2, t-1
+
+#     for _ in range(prediction_horizon):
+#         # Predict the next time step
+#         original_sample, generated_sample = generate_images(model, original_sample, sample_past1, sample_past2)
+        
+#         # print("original_sample.shape:", original_sample.shape, "generated_sample.shape:", generated_sample.shape)
+        
+#         # Append the prediction to the list of predictions
+#         predictions.append(generated_sample)
+
+#         sample_past1 = sample_past2
+#         sample_past2 = generated_sample
+        
+
+#     # Concatenate predictions along the time steps axis
+#     predictions = np.concatenate(predictions, axis=0)
+#     return predictions
+
+def predict_autoregressive(model, initial_inputs, prediction_horizon):
     predictions = []
     
-    original_sample, sample_past1, sample_past2 = initial_inputs[0], initial_inputs[1], initial_inputs[2]  # t, t-2, t-1
+    # These now have shape (batch_size, H, W, C)
+    original_sample, sample_past1, sample_past2 = initial_inputs[0], initial_inputs[1], initial_inputs[2]  
 
     for _ in range(prediction_horizon):
-        # Predict the next time step
+        # Generate the next step for the ENTIRE batch at once
         original_sample, generated_sample = generate_images(model, original_sample, sample_past1, sample_past2)
         
-        print("original_sample.shape:", original_sample.shape, "generated_sample.shape:", generated_sample.shape)
-        
-        # Append the prediction to the list of predictions
         predictions.append(generated_sample)
 
+        # Shift the autoregressive window
         sample_past1 = sample_past2
         sample_past2 = generated_sample
         
-
-    # Concatenate predictions along the time steps axis
-    predictions = np.concatenate(predictions, axis=0)
-    return predictions
+    # Stack along axis=1 to create a distinct time dimension.
+    # Resulting shape: (batch_size, prediction_horizon, H, W, C)
+    predictions = tf.stack(predictions, axis=1) 
+    return predictions.numpy()
 
 # %%
 # channels = ['geopotential_500', 'temperature_850', 
@@ -369,73 +399,70 @@ rmse_matrix = np.zeros((num_sample, num_channel, num_lead))
 acc_matrix = np.zeros((num_sample, num_channel, num_lead))
 
 
-for z in range(num_sample):
-    #print("sample #", z)
-    original_samples = tf.convert_to_tensor(test_data_tf_norm_pred[z:z+num_lead], dtype=tf.float32)
-    original_samples_past1 = tf.convert_to_tensor(test_data_tf_norm_past1[z:z+num_lead], dtype=tf.float32)
-    original_samples_past2 = tf.convert_to_tensor(test_data_tf_norm_past2[z:z+num_lead], dtype=tf.float32)
+# for z in tqdm(range(num_sample)):
+#     #print("sample #", z)
+#     original_samples = tf.convert_to_tensor(test_data_tf_norm_pred[z:z+num_lead], dtype=tf.float32)
+#     original_samples_past1 = tf.convert_to_tensor(test_data_tf_norm_past1[z:z+num_lead], dtype=tf.float32)
+#     original_samples_past2 = tf.convert_to_tensor(test_data_tf_norm_past2[z:z+num_lead], dtype=tf.float32)
     
-    print(original_samples.shape, original_samples_past1.shape, original_samples_past2.shape)
+#     # print(original_samples.shape, original_samples_past1.shape, original_samples_past2.shape)
     
-    initial_inputs = [tf.convert_to_tensor(original_samples[0:1], dtype=tf.float32),
-                  tf.convert_to_tensor(original_samples_past1[0:1], dtype=tf.float32), 
-                  tf.convert_to_tensor(original_samples_past2[0:1], dtype=tf.float32)
-                 ]
+#     initial_inputs = [tf.convert_to_tensor(original_samples[0:1], dtype=tf.float32),
+#                   tf.convert_to_tensor(original_samples_past1[0:1], dtype=tf.float32), 
+#                   tf.convert_to_tensor(original_samples_past2[0:1], dtype=tf.float32)
+#                  ]
 
+#     future_predictions = predict_autoregressive(model, initial_inputs, prediction_horizon=num_lead)
+
+#     original_samples_unnormlalized = batch_norm_reverse(test_data_tf, test_data_tf.shape, 1459, original_samples)
+#     generated_samples_unnormlalized = batch_norm_reverse(test_data_tf, test_data_tf.shape, 1459, future_predictions)
+    
+#     # print(original_samples_unnormlalized.shape, generated_samples_unnormlalized.shape)
+    
+#     os.makedirs(os.path.join(output_folder, str(z)), exist_ok=True)
+#     for t in range(num_lead):
+#         np.save(os.path.join(output_folder, str(z), f'{t}.npy'), generated_samples_unnormlalized[t])
+    
+    
+inference_batch_size = 64
+
+for z in tqdm(range(0, num_sample, inference_batch_size)):
+    # Calculate the current batch size (this prevents errors on the final, smaller batch)
+    current_batch = min(inference_batch_size, num_sample - z)
+    
+    # 1. Slice starting conditions for the entire batch
+    # This grabs t=0 for z, z+1, ..., z+current_batch-1
+    # Shape becomes (current_batch, H, W, C)
+    batch_pred_t0 = tf.convert_to_tensor(test_data_tf_norm_pred[z : z + current_batch], dtype=tf.float32)
+    batch_past1_t0 = tf.convert_to_tensor(test_data_tf_norm_past1[z : z + current_batch], dtype=tf.float32)
+    batch_past2_t0 = tf.convert_to_tensor(test_data_tf_norm_past2[z : z + current_batch], dtype=tf.float32)
+    
+    initial_inputs = [batch_pred_t0, batch_past1_t0, batch_past2_t0]
+
+    # 2. Predict the future for the entire batch
+    # Returns shape: (current_batch, num_lead, H, W, C)
     future_predictions = predict_autoregressive(model, initial_inputs, prediction_horizon=num_lead)
 
-    original_samples_unnormlalized = batch_norm_reverse(test_data_tf, test_data_tf.shape, 1459, original_samples)
-    generated_samples_unnormlalized = batch_norm_reverse(test_data_tf, test_data_tf.shape, 1459, future_predictions)
+    # 3. Unnormalize
+    # Depending on how batch_norm_reverse is written, it might not handle 5D tensors well.
+    # To be safe, we flatten the batch and time dimensions into one, unnormalize, then reshape back.
+    _, H, W, C = future_predictions.shape[1:]
+    flat_preds = tf.reshape(future_predictions, (current_batch * num_lead, H, W, C))
     
-    print(original_samples_unnormlalized.shape, generated_samples_unnormlalized.shape)
+    unnorm_flat = batch_norm_reverse(test_data_tf, test_data_tf.shape, 1459, flat_preds)
     
-    os.makedirs(os.path.join(output_folder, str(z)), exist_ok=True)
-    for t in range(num_lead):
-        np.save(os.path.join(output_folder, str(z), f'{t}.npy'), generated_samples_unnormlalized[t])
+    # Reshape back to (batch, time, H, W, C)
+    generated_samples_unnormlalized = tf.reshape(unnorm_flat, (current_batch, num_lead, H, W, C)).numpy()
     
-    
-#     for i in range(num_channel):
-#         print(f'{channels[i]}:')
-#         for j in range(num_lead):
-#             # print(f't{num_lead*(j+1)}: {lat_weighted_rmse_one_var(original_samples_unnormlalized[j:j+1], generated_samples_unnormlalized[j:j+1], var_idx=i, resolution=5.625):.5f}')
-#             rmse_matrix[z][i][j] = lat_weighted_rmse_one_var(original_samples_unnormlalized[j:j+1], generated_samples_unnormlalized[j:j+1], var_idx=i, resolution=5.625)
-#             acc_matrix[z][i][j] = lat_weighted_acc_one_var(original_samples_unnormlalized[j:j+1], generated_samples_unnormlalized[j:j+1], var_idx=i, resolution=5.625, clim=test_data_tf)
-#         print('\n')
-
-#     # print("rmse_matrix.shape:", rmse_matrix.shape)
-#     # print("acc_matrix.shape:", acc_matrix.shape)
-
-# # %%
-# # ddpm_weather_56c2_56_5var_cp3_1000
-# rmse_matrix_mean = np.mean(rmse_matrix, axis=0)
-# rmse_matrix_mean
-
-# # %%
-# # ddpm_weather_56c2_56_5var_cp3_1000
-# acc_matrix_mean = np.mean(acc_matrix, axis=0)
-# acc_matrix_mean
-
-# # %%
-# # ddpm_weather_56c2_56_5var_cp3_2000
-# rmse_matrix_mean = np.mean(rmse_matrix, axis=0)
-# rmse_matrix_mean
-
-# # %%
-# # ddpm_weather_56c2_56_5var_cp3_1500
-# rmse_matrix_mean = np.mean(rmse_matrix, axis=0)
-# rmse_matrix_mean
-
-# # %%
-# # ddpm_weather_56c2_56_5var_cp3_750
-# rmse_matrix_mean = np.mean(rmse_matrix, axis=0)
-# rmse_matrix_mean
-
-# # %%
-# # ddpm_weather_56c2_56_5var_cp3_500
-# rmse_matrix_mean = np.mean(rmse_matrix, axis=0)
-# rmse_matrix_mean
-
-# # %%
-# # ddpm_weather_56c2_56_5var_cp3_250
-# rmse_matrix_mean = np.mean(rmse_matrix, axis=0)
-# rmse_matrix_mean
+    # 4. Save to disk
+    for b in range(current_batch):
+        # Calculate the actual sample index for saving
+        sample_idx = z + b 
+        
+        os.makedirs(os.path.join(output_folder, str(sample_idx)), exist_ok=True)
+        for t in range(num_lead):
+            np.save(
+                os.path.join(output_folder, str(sample_idx), f'{t}.npy'), 
+                generated_samples_unnormlalized[b, t]
+            )
+            

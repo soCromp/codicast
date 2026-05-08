@@ -33,8 +33,10 @@ tf.__version__
 # ## Hyperparameters
 
 # %%
+out_name = '/mnt/data/sonia/codicast-out/date/multivar/checkpoints/ddpm3_weather_56c2_56_multivar_cp3'
+
 batch_size = 256
-num_epochs = 800         # Just for the sake of demonstration
+num_epochs = 400         # Just for the sake of demonstration
 total_timesteps = 1000   # 1000
 norm_groups = 8          # Number of groups used in GroupNormalization layer
 learning_rate = 1e-4
@@ -57,9 +59,9 @@ resolution_folder = '56degree'
 resolution = '5.625'  
 var_num = '5'
 
-train_data_tf = np.load("/mnt/data/sonia/codicast-data/multivar/concat_1940_2015_" + resolution + "_" + var_num + "var.npy")
-val_data_tf = np.load("/mnt/data/sonia/codicast-data/multivar/concat_2016_2016_" + resolution + "_" + var_num + "var.npy")
-test_data_tf = np.load("/mnt/data/sonia/codicast-data/multivar/concat_2016_2024_" + resolution + "_" + var_num + "var.npy")
+train_data_tf = np.load("/mnt/data/sonia/codicast-data/multivar/concat_1940_2015_" + resolution + "_" + var_num + "var.npy", mmap_mode='r')
+val_data_tf = np.load("/mnt/data/sonia/codicast-data/multivar/concat_2016_2016_" + resolution + "_" + var_num + "var.npy", mmap_mode='r')
+test_data_tf = np.load("/mnt/data/sonia/codicast-data/multivar/concat_2016_2024_" + resolution + "_" + var_num + "var.npy", mmap_mode='r')
 
 # %%
 train_data_tf = train_data_tf.transpose((0, 2, 3, 1))
@@ -226,15 +228,15 @@ class DiffusionModel(keras.Model):
         with tf.GradientTape() as tape:
             # 3. Sample random noise to be added to the images in the batch
             noise = tf.random.normal(shape=tf.shape(images), dtype=images.dtype)
-            print("noise.shape:", noise.shape)
+            # print("noise.shape:", noise.shape)
             
             # 4. Diffuse the images with noise
             images_t = self.gdf_util.q_sample(images, t, noise)
-            print("images_t.shape:", images_t.shape)
+            # print("images_t.shape:", images_t.shape)
             
             # 5. Pass the diffused images and time steps to the network
             pred_noise = self.network([images_t, t, image_input_past1, image_input_past2], training=True)
-            print("pred_noise.shape:", pred_noise.shape)
+            # print("pred_noise.shape:", pred_noise.shape)
             
             # 6. Calculate the loss
             loss = self.loss(noise, pred_noise)
@@ -368,8 +370,8 @@ val_dataset = tf.data.Dataset.from_generator(
 
 # %%
 
-train_dataset = train_dataset.shuffle(buffer_size=1024).batch(batch_size).prefetch(tf.data.AUTOTUNE)
-val_dataset = val_dataset.shuffle(buffer_size=1024).batch(batch_size).prefetch(tf.data.AUTOTUNE)
+train_dataset = train_dataset.shuffle(buffer_size=1024).repeat().batch(batch_size).prefetch(tf.data.AUTOTUNE)
+val_dataset = val_dataset.shuffle(buffer_size=1024).repeat().batch(batch_size).prefetch(tf.data.AUTOTUNE)
 # train_dataset = train_dataset.map(lambda x, y: ((tf.squeeze(x[0]), tf.squeeze(x[1]), tf.squeeze(x[2])), tf.squeeze(y)))
 # val_dataset = val_dataset.map(lambda x, y: ((tf.squeeze(x[0]), tf.squeeze(x[1]), tf.squeeze(x[2])), tf.squeeze(y)))
 
@@ -399,6 +401,33 @@ lr_schedule = keras.optimizers.schedules.ExponentialDecay(initial_learning_rate=
                                                           decay_rate=decay_rate
                                                          )
 
+
+# Calculate steps
+train_steps = math.ceil(len(train_data_tf_norm_pred) / batch_size)
+val_steps = math.ceil(len(val_data_tf_norm_pred) / batch_size)
+
+print(f"Total training samples: {len(train_data_tf_norm_pred)}")
+print(f"Steps per epoch: {train_steps}")
+print(f"Validation steps: {val_steps}")
+
+cp_callback = keras.callbacks.ModelCheckpoint(
+    filepath=out_name, 
+    save_weights_only=True,
+    save_best_only=True,
+    monitor='val_loss',
+    mode='min',  
+    save_freq='epoch',
+    verbose=1,
+)
+
+# 2. Define the Early Stopping Callback
+early_stopping_callback = keras.callbacks.EarlyStopping(
+    monitor='val_loss',        # The metric to watch (Keras adds 'val_' to the loss returned by test_step)
+    patience=50,               # Number of epochs to wait for improvement before stopping
+    restore_best_weights=True, # Automatically restores the weights from the epoch with the best val_loss
+    verbose=1                  # Prints a message when early stopping is triggered
+)
+
 # Compile the model
 model.compile(
               loss=keras.losses.MeanSquaredError(),
@@ -410,12 +439,15 @@ model.compile(
 model.fit(train_dataset,
           validation_data=val_dataset,
           epochs=num_epochs,
-          batch_size=batch_size
+        #   batch_size=batch_size,
+          steps_per_epoch=train_steps,  # This fixes the progress bar
+          validation_steps=val_steps,     # This ensures validation doesn't loop infinitely
+          callbacks=[cp_callback, early_stopping_callback]
          )
 
 # %%
 # Save weights
-# model.save_weights('../checkpoints/ddpm_weather_56c2_56_multivar_cp3')
+model.save_weights(out_name)
 
 # %%
 # Restore weights
