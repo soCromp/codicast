@@ -15,17 +15,17 @@ from pyproj import Proj
 from scipy.interpolate import RegularGridInterpolator
 from tqdm import tqdm
 
-inpath = '/mnt/data/sonia/codicast-out/date/multivar/raw-out/test'
+inpath = '/mnt/data/sonia/codicast-out/date/multivar/raw-out3/test'
 input_topo = '/home/cyclone/topo.nc'
-outpath_mcms = '/mnt/data/sonia/codicast-out/date/multivar/mcms-in/test'
-outpath_patches = '/mnt/data/sonia/codicast-out/date/multivar/patches/test'
+outpath_mcms = '/mnt/data/sonia/codicast-out/date/multivar/mcms-in/test3'
+outpath_patches = '/mnt/data/sonia/codicast-out/date/multivar/patches/test3'
 
 timesteps = 8
 
 ############################ load storm df #############################
 start_year = 2015
-trackspath1='/home/sonia/mcms/tracker/1940-2010/era5/out_era5/era5/mcms_era5_1940_2010_tracks.txt'
-trackspath2='/home/sonia/mcms/tracker/2010-2024/era5/out_era5/era5/FIXEDmcms_era5_2010_2024_tracks.txt'
+trackspath1='/mnt/data/sonia/mcms/tracker/1940-2010/era5/out_era5/era5/mcms_era5_1940_2010_tracks.txt'
+trackspath2='/mnt/data/sonia/mcms/tracker/2010-2024/era5/out_era5/era5/FIXEDmcms_era5_2010_2024_tracks.txt'
 joinyear = 2010 # overlap for the track data
 tracks1 = pd.read_csv(trackspath1, sep=' ', header=None, 
         names=['year', 'month', 'day', 'hour', 'total_hrs', 'unk1', 'unk2', 'unk3', 'unk4', 'unk5', 'unk6', 

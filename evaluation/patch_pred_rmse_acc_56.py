@@ -5,13 +5,15 @@
 import math
 import numpy as np
 import matplotlib.pyplot as plt
+import glob
 
 # Requires TensorFlow >=2.11 for the GroupNormalization layer.
 import tensorflow as tf
 from tensorflow import keras
-from tensorflow.keras import layers
+from tensorflow.keras import layers, mixed_precision
 from tensorflow.keras.layers import Input, ConvLSTM2D, BatchNormalization, Conv3D
 from tensorflow.keras.callbacks import *
+mixed_precision.set_global_policy('mixed_float16')
 
 import os
 import sys
@@ -38,14 +40,15 @@ from tqdm import tqdm
 # ## Hyperparameters
 
 # %%
+output_folder = '/mnt/data/sonia/codicast-patch/date/multivar/raw-out1-autoregress/test'
+network_path = '/mnt/data/sonia/codicast-patch/date/multivar/checkpoints/ddpm1_weather_56c2_patch_multivar_cp3/checkpoint'
+
 batch_size = 1024
-num_epochs = 800         # Just for the sake of demonstration
-total_timesteps = 750   # 1000
+total_timesteps = 1000
 norm_groups = 8          # Number of groups used in GroupNormalization layer
-learning_rate = 1e-4
 
 img_size_H = 32
-img_size_W = 64
+img_size_W = 32
 img_channels = 5
 
 first_conv_channels = 64
@@ -54,90 +57,21 @@ widths = [first_conv_channels * mult for mult in channel_multiplier]
 has_attention = [False, False, True, True]
 num_res_blocks = 2  # Number of residual blocks
 
-# %% [markdown]
-# ## Gaussian diffusion utilities
-# 
-# We define the **forward process** and the **reverse process** as a separate utility. Most of the code in this utility has been borrowed
-# from the original implementation with some slight modifications.
-
 # %%
 from layers.diffusion import GaussianDiffusion
-
-# %% [markdown]
-# ## Network architecture
-# 
-# U-Net, originally developed for semantic segmentation, is an architecture that is
-# widely used for implementing diffusion models but with some slight modifications:
-# 
-# 1. The network accepts two inputs: Image and time step
-# 2. Self-attention between the convolution blocks once we reach a specific resolution
-# (16x16 in the paper)
-# 3. Group Normalization instead of weight normalization
-# 
-# We implement most of the things as used in the original paper. We use the
-# `swish` activation function throughout the network. We use the variance scaling
-# kernel initializer.
-# 
-# The only difference here is the number of groups used for the
-# `GroupNormalization` layer. For the flowers dataset,
-# we found that a value of `groups=8` produces better results
-# compared to the default value of `groups=32`. Dropout is optional and should be
-# used where chances of over fitting is high. In the paper, the authors used dropout
-# only when training on CIFAR10.
-
-# %%
 from tensorflow.keras.models import load_model
 
-pretrained_encoder = load_model('../saved_models/encoder_cnn_56deg_multivar.h5')
-pretrained_encoder.summary()
-
-# %%
-# Extract the first 5 layers
-first_five_layers = pretrained_encoder.layers[:5]
-
-# Display the first four layers to confirm
-for i, layer in enumerate(first_five_layers):
-    print(f"Layer {i}: {layer}")
-
-# Create a new model using these layers
-# Get the input of the pre-trained model
-input_layer = pretrained_encoder.input
-
-# Get the output of the fourth layer
-output_layer = first_five_layers[-1].output
-
-# Create the new model
-pretrained_encoder = tf.keras.Model(inputs=input_layer, outputs=output_layer)
-
-# Print the summary of the new model
-pretrained_encoder.summary()
-
-# %%
+encoder = keras.models.load_model('../saved_models/encoder_cnn_patch_multivar.h5')
+encoder.trainable = False
+bottleneck_layer = encoder.get_layer('bottleneck').output
+pretrained_encoder = tf.keras.Model(inputs=encoder.input, outputs=bottleneck_layer)
 for layer in pretrained_encoder.layers:
     layer.trainable = False
 
 pretrained_encoder._name = 'encoder'
 
 # %%
-from layers.denoiser import build_unet_model_c2, build_unet_model_c2_no_cross_attn, build_unet_model_c2_no_encoder, build_unet_model_c2_no_cross_attn_encoder
-
-# %%
-# Build the unet model
-network = build_unet_model_c2(
-    img_size_H=img_size_H,
-    img_size_W=img_size_W,
-    img_channels=img_channels,
-    widths=widths,
-    has_attention=has_attention,
-    num_res_blocks=num_res_blocks,
-    norm_groups=norm_groups,
-    first_conv_channels=first_conv_channels,
-    activation_fn=keras.activations.swish,
-    encoder=pretrained_encoder,
-)
-
-# %%
-# network.summary()
+from layers.denoiser import build_unet_model_c2 
 
 # %% [markdown]
 # ## Model loading
@@ -165,21 +99,25 @@ class DiffusionModel(keras.Model):
         with tf.GradientTape() as tape:
             # 3. Sample random noise to be added to the images in the batch
             noise = tf.random.normal(shape=tf.shape(images), dtype=images.dtype)
-            print("noise.shape:", noise.shape)
+            # print("noise.shape:", noise.shape)
             
             # 4. Diffuse the images with noise
             images_t = self.gdf_util.q_sample(images, t, noise)
-            print("images_t.shape:", images_t.shape)
+            # print("images_t.shape:", images_t.shape)
             
             # 5. Pass the diffused images and time steps to the network
             pred_noise = self.network([images_t, t, image_input_past1, image_input_past2], training=True)
-            print("pred_noise.shape:", pred_noise.shape)
+            # print("pred_noise.shape:", pred_noise.shape)
             
             # 6. Calculate the loss
             loss = self.loss(noise, pred_noise)
+            
+            # Scale the loss to prevent float16 underflow
+            scaled_loss = self.optimizer.get_scaled_loss(loss)
 
         # 7. Get the gradients
-        gradients = tape.gradient(loss, self.network.trainable_weights)
+        scaled_gradients = tape.gradient(scaled_loss, self.network.trainable_weights)
+        gradients = self.optimizer.get_unscaled_gradients(scaled_gradients) # unscale
 
         # 8. Update the weights of the network
         self.optimizer.apply_gradients(zip(gradients, self.network.trainable_weights))
@@ -216,10 +154,7 @@ class DiffusionModel(keras.Model):
 
         # 7. Return loss values
         return {"loss": loss}
-
-# %% [markdown]
-# ### Load trained model
-
+    
 # %%
 # Build the unet model
 network = build_unet_model_c2(
@@ -233,6 +168,7 @@ network = build_unet_model_c2(
     first_conv_channels=first_conv_channels,
     activation_fn=keras.activations.swish,
     encoder=pretrained_encoder,
+    interpolation="bilinear"
 )
 
 ema_network = build_unet_model_c2(
@@ -246,12 +182,15 @@ ema_network = build_unet_model_c2(
     first_conv_channels=first_conv_channels,
     activation_fn=keras.activations.swish,
     encoder=pretrained_encoder,
+    interpolation="bilinear"
 )
+network.load_weights(network_path)
 ema_network.set_weights(network.get_weights())  # Initially the weights are the same
 
 # %%
 # Get an instance of the Gaussian Diffusion utilities
 gdf_util = GaussianDiffusion(timesteps=total_timesteps)
+
 
 # Get the model
 model = DiffusionModel(
@@ -261,15 +200,6 @@ model = DiffusionModel(
     timesteps=total_timesteps,
 )
 
-# %%
-## -------------------- ablation study --------------------
-model.load_weights('/mnt/data/sonia/codicast-out/date/multivar/checkpoints/ddpm3_weather_56c2_56_multivar_cp3')  # CoDiCast with 1000 steps
-# model.load_weights('../checkpoints/ddpm_weather_56c2_56_5var_cp3_no_cross_attn')
-# model.load_weights('../checkpoints/ddpm_weather_56c2_56_5var_cp3_no_encoder')
-# model.load_weights('../checkpoints/ddpm_weather_56c2_56_5var_cp3_no_cross_attn_encoder')
-
-## -------------------- diffusion steps --------------------
-# model.load_weights('../checkpoints/ddpm_weather_56c2_56_5var_cp3_750')
 
 # %% [markdown]
 # ## Results
@@ -279,27 +209,76 @@ from utils.normalization import batch_norm, batch_norm_reverse
 from utils.metrics import lat_weighted_rmse_one_var, lat_weighted_acc_one_var
 
 # %%
-resolution_folder = '56degree'
-resolution = '5.625'  
-var_num = '5'
+def load_temporal_triplets(base_path):
+    past1_list, past2_list, target_list = [], [], []
+    
+    # Find all storm directories
+    storm_dirs = [os.path.join(base_path, d) for d in os.listdir(base_path) if os.path.isdir(os.path.join(base_path, d))]
+    
+    for storm_dir in storm_dirs:
+        # Load all 8 frames for this storm
+        frames = []
+        for i in range(8):
+            filepath = os.path.join(storm_dir, f"{i}.npy")
+            if os.path.exists(filepath):
+                frames.append(np.load(filepath))
+        
+        # If the storm has all 8 frames, extract sliding windows of 3
+        if len(frames) == 8:
+            for t in range(2, 8):
+                past1_list.append(frames[t-2]) # T-2
+                past2_list.append(frames[t-1]) # T-1
+                target_list.append(frames[t])  # T (The diffusion target)
+                
+    return np.stack(target_list), np.stack(past1_list), np.stack(past2_list)
 
-output_folder = '/mnt/data/sonia/codicast-out/date/multivar/raw-out3/test'
+# Load data (Update paths as needed)
+train_pred, train_past1, train_past2 = \
+    load_temporal_triplets('/home/cyclone/train/multivar/0.25/date/natlantic/train')
+val_pred, val_past1, val_past2 = \
+    load_temporal_triplets('/home/cyclone/train/multivar/0.25/date/satlantic/val')
+test_pred, test_past1, test_past2 = \
+    load_temporal_triplets('/home/cyclone/train/multivar/0.25/date/natlantic/test')
 
-# test_data_tf = np.load("/mnt/data/sonia/codicast-data/default/concat_2017_2018_" + resolution + "_" + var_num + "var.npy")
-test_data_tf = np.load("/mnt/data/sonia/codicast-data/multivar/concat_2016_2024_" + resolution + "_" + var_num + "var.npy")
-test_data_tf = test_data_tf.transpose((0, 2, 3, 1))
-test_data_tf.shape
+# Apply Southern Hemisphere V-wind flip if doing it directly in memory
+val_pred = np.flip(val_pred, axis=1)
+val_past1 = np.flip(val_past1, axis=1)
+val_past2 = np.flip(val_past2, axis=1)
+v_idx = 2 # Assuming wind-v is index 2
+val_pred[..., v_idx] *= -1
+val_past1[..., v_idx] *= -1
+val_past2[..., v_idx] *= -1
+
+print(train_pred.shape, train_past1.shape, train_past2.shape)
 
 # %%
-test_data_tf_norm = batch_norm(test_data_tf, test_data_tf.shape, batch_size=1460)
-test_data_tf_norm.shape
 
-# %%
-test_data_tf_norm_pred = test_data_tf_norm[2:]
-test_data_tf_norm_past1 = test_data_tf_norm[:-2]
-test_data_tf_norm_past2 = test_data_tf_norm[1:-1]
+from utils.patch_normalization import KerasHybridNormalizer
 
-print(test_data_tf_norm_pred.shape, test_data_tf_norm_past1.shape, test_data_tf_norm_past2.shape)
+channel_names = ['slp', 'wind-u', 'wind-v', 'temperature', 'humidity']
+normalizer = KerasHybridNormalizer(channel_names)
+normalizer.fit(train_pred, clamp=True)
+
+train_norm_pred = normalizer.normalize(train_pred)
+train_norm_past1 = normalizer.normalize(train_past1)
+train_norm_past2 = normalizer.normalize(train_past2)
+
+val_norm_pred = normalizer.normalize(val_pred)
+val_norm_past1 = normalizer.normalize(val_past1)
+val_norm_past2 = normalizer.normalize(val_past2)
+
+test_norm_pred = normalizer.normalize(test_pred)
+test_norm_past1 = normalizer.normalize(test_past1)
+test_norm_past2 = normalizer.normalize(test_past2)
+
+
+print(train_norm_pred.shape, train_norm_past1.shape, train_norm_past2.shape)
+print(val_norm_pred.shape, val_norm_past1.shape, val_norm_past2.shape)
+print(test_norm_pred.shape, test_norm_past1.shape, test_norm_past2.shape)
+
+# test_dataset = tf.data.Dataset.from_tensor_slices(
+#     ((test_norm_pred, test_norm_past1, test_norm_past2), test_norm_pred)
+# ).batch(batch_size).prefetch(tf.data.AUTOTUNE)
 
 # %% [markdown]
 # ### RSME & ACC
@@ -312,7 +291,7 @@ from utils.metrics import lat_weighted_rmse_one_var, lat_weighted_acc_one_var
 import tensorflow as tf
 import numpy as np
 
-def generate_images(model, original_samples, original_samples_past1, original_samples_past2):
+def generate_images(model, original_samples, original_samples_past1, original_samples_past2, frame_num=None):
     """
     @model: trained denoiser
     @original_samples: it just provides the shape, does not involve generation
@@ -327,8 +306,10 @@ def generate_images(model, original_samples, original_samples_past1, original_sa
     # 1. Randomly sample noise (starting point for reverse process)
     samples = tf.random.normal(shape=(num_images, img_size_H, img_size_W, img_channels), dtype=tf.float32)
     
+    desc = f"Denoising Frame {frame_num}" if frame_num is not None else "Denoising"
+    
     # 2. Sample from the model iteratively
-    for t in reversed(range(0, total_timesteps)):
+    for t in tqdm(reversed(range(0, total_timesteps)), total=total_timesteps, desc=desc, leave=False):
         tt = tf.cast(tf.fill([num_images], t), dtype=tf.int64)
         pred_noise = model.ema_network([samples, tt, original_samples_past1, original_samples_past2],
                                                training=False
@@ -337,31 +318,6 @@ def generate_images(model, original_samples, original_samples_past1, original_sa
         
     # 3. Return generated samples and original samples
     return original_samples, samples
-    # return original_samples.numpy(), samples.numpy()
-
-# %%
-# def predict_autoregressive(model, initial_inputs, prediction_horizon):
-    
-#     predictions = []
-    
-#     original_sample, sample_past1, sample_past2 = initial_inputs[0], initial_inputs[1], initial_inputs[2]  # t, t-2, t-1
-
-#     for _ in range(prediction_horizon):
-#         # Predict the next time step
-#         original_sample, generated_sample = generate_images(model, original_sample, sample_past1, sample_past2)
-        
-#         # print("original_sample.shape:", original_sample.shape, "generated_sample.shape:", generated_sample.shape)
-        
-#         # Append the prediction to the list of predictions
-#         predictions.append(generated_sample)
-
-#         sample_past1 = sample_past2
-#         sample_past2 = generated_sample
-        
-
-#     # Concatenate predictions along the time steps axis
-#     predictions = np.concatenate(predictions, axis=0)
-#     return predictions
 
 def predict_autoregressive(model, initial_inputs, prediction_horizon):
     predictions = []
@@ -369,9 +325,9 @@ def predict_autoregressive(model, initial_inputs, prediction_horizon):
     # These now have shape (batch_size, H, W, C)
     original_sample, sample_past1, sample_past2 = initial_inputs[0], initial_inputs[1], initial_inputs[2]  
 
-    for _ in range(prediction_horizon):
+    for step in range(prediction_horizon):
         # Generate the next step for the ENTIRE batch at once
-        original_sample, generated_sample = generate_images(model, original_sample, sample_past1, sample_past2)
+        original_sample, generated_sample = generate_images(model, original_sample, sample_past1, sample_past2, frame_num=step+1)
         
         predictions.append(generated_sample)
 
@@ -397,31 +353,6 @@ num_lead = 8
 
 rmse_matrix = np.zeros((num_sample, num_channel, num_lead))
 acc_matrix = np.zeros((num_sample, num_channel, num_lead))
-
-
-# for z in tqdm(range(num_sample)):
-#     #print("sample #", z)
-#     original_samples = tf.convert_to_tensor(test_data_tf_norm_pred[z:z+num_lead], dtype=tf.float32)
-#     original_samples_past1 = tf.convert_to_tensor(test_data_tf_norm_past1[z:z+num_lead], dtype=tf.float32)
-#     original_samples_past2 = tf.convert_to_tensor(test_data_tf_norm_past2[z:z+num_lead], dtype=tf.float32)
-    
-#     # print(original_samples.shape, original_samples_past1.shape, original_samples_past2.shape)
-    
-#     initial_inputs = [tf.convert_to_tensor(original_samples[0:1], dtype=tf.float32),
-#                   tf.convert_to_tensor(original_samples_past1[0:1], dtype=tf.float32), 
-#                   tf.convert_to_tensor(original_samples_past2[0:1], dtype=tf.float32)
-#                  ]
-
-#     future_predictions = predict_autoregressive(model, initial_inputs, prediction_horizon=num_lead)
-
-#     original_samples_unnormlalized = batch_norm_reverse(test_data_tf, test_data_tf.shape, 1459, original_samples)
-#     generated_samples_unnormlalized = batch_norm_reverse(test_data_tf, test_data_tf.shape, 1459, future_predictions)
-    
-#     # print(original_samples_unnormlalized.shape, generated_samples_unnormlalized.shape)
-    
-#     os.makedirs(os.path.join(output_folder, str(z)), exist_ok=True)
-#     for t in range(num_lead):
-#         np.save(os.path.join(output_folder, str(z), f'{t}.npy'), generated_samples_unnormlalized[t])
     
     
 inference_batch_size = 64
@@ -433,9 +364,9 @@ for z in tqdm(range(0, num_sample, inference_batch_size)):
     # 1. Slice starting conditions for the entire batch
     # This grabs t=0 for z, z+1, ..., z+current_batch-1
     # Shape becomes (current_batch, H, W, C)
-    batch_pred_t0 = tf.convert_to_tensor(test_data_tf_norm_pred[z : z + current_batch], dtype=tf.float32)
-    batch_past1_t0 = tf.convert_to_tensor(test_data_tf_norm_past1[z : z + current_batch], dtype=tf.float32)
-    batch_past2_t0 = tf.convert_to_tensor(test_data_tf_norm_past2[z : z + current_batch], dtype=tf.float32)
+    batch_pred_t0 = tf.convert_to_tensor(test_norm_pred[z : z + current_batch], dtype=tf.float32)
+    batch_past1_t0 = tf.convert_to_tensor(test_norm_past1[z : z + current_batch], dtype=tf.float32)
+    batch_past2_t0 = tf.convert_to_tensor(test_norm_past2[z : z + current_batch], dtype=tf.float32)
     
     initial_inputs = [batch_pred_t0, batch_past1_t0, batch_past2_t0]
 
@@ -444,15 +375,7 @@ for z in tqdm(range(0, num_sample, inference_batch_size)):
     future_predictions = predict_autoregressive(model, initial_inputs, prediction_horizon=num_lead)
 
     # 3. Unnormalize
-    # Depending on how batch_norm_reverse is written, it might not handle 5D tensors well.
-    # To be safe, we flatten the batch and time dimensions into one, unnormalize, then reshape back.
-    _, H, W, C = future_predictions.shape[1:]
-    flat_preds = tf.reshape(future_predictions, (current_batch * num_lead, H, W, C))
-    
-    unnorm_flat = batch_norm_reverse(test_data_tf, test_data_tf.shape, 1459, flat_preds)
-    
-    # Reshape back to (batch, time, H, W, C)
-    generated_samples_unnormlalized = tf.reshape(unnorm_flat, (current_batch, num_lead, H, W, C)).numpy()
+    generated_samples_unnormlalized = normalizer.denormalize(future_predictions)
     
     # 4. Save to disk
     for b in range(current_batch):

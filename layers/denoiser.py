@@ -38,7 +38,7 @@ class AttentionBlock(layers.Layer):
         batch_size = tf.shape(inputs)[0]
         height = tf.shape(inputs)[1]
         width = tf.shape(inputs)[2]
-        scale = tf.cast(self.units, tf.float32) ** (-0.5)
+        scale = tf.cast(self.units, inputs.dtype) ** (-0.5)
 
         inputs = self.norm(inputs)
         q = self.query(inputs)
@@ -174,7 +174,7 @@ def build_unet_model_c2(img_size_H,
                                             )(image_input_past_embed1)
     print("image_input_past_embed1 shape:", image_input_past_embed1.shape)
 
-    image_input_past_embed2 = encoder(image_input_past1)
+    image_input_past_embed2 = encoder(image_input_past2)
     image_input_past_embed2 = layers.Conv2D(first_conv_channels,
                                              kernel_size=(3, 3),
                                              padding="same",
@@ -183,15 +183,15 @@ def build_unet_model_c2(img_size_H,
     print("image_input_past_embed2 shape:", image_input_past_embed2.shape)
 
 
-    image_input_past = layers.Concatenate(axis=-1)([image_input_past1, image_input_past2])
-    image_input_past = layers.Conv2D(first_conv_channels,
+    image_input_past_latent = layers.Concatenate(axis=-1)([image_input_past_embed1, image_input_past_embed2])
+    image_input_past_latent = layers.Conv2D(first_conv_channels,
                                      kernel_size=(3, 3),
                                      padding="same",
                                      kernel_initializer=kernel_init(1.0),
-                                    )(image_input_past)
-    print("image_input_past shape:", image_input_past.shape)
+                                    )(image_input_past_latent)
+    print("image_input_past_latent shape:", image_input_past_latent.shape)
     
-    image_input_past_embed = layers.Reshape((32*64, first_conv_channels))(image_input_past)
+    image_input_past_embed = layers.Reshape((64, first_conv_channels))(image_input_past_latent)
     print("image_input_past shape:", image_input_past_embed.shape)
 
 
@@ -202,15 +202,15 @@ def build_unet_model_c2(img_size_H,
                                       padding="same",
                                       kernel_initializer=kernel_init(1.0),
                                      )(image_input)
-    image_input_embed = layers.Reshape((32*64, first_conv_channels))(image_input_embed)
+    image_input_embed = layers.Reshape((1024, first_conv_channels))(image_input_embed)
 
     # ================= cross_attention =================
-    cross_atte = layers.MultiHeadAttention(num_heads=1, key_dim=256)(image_input_past_embed, image_input_embed)
+    cross_atte = layers.MultiHeadAttention(num_heads=1, key_dim=256)(image_input_embed, image_input_past_embed)
     
     
-    x = layers.Add()([image_input_embed, image_input_past_embed])
-    x = layers.Add()([x, cross_atte])
-    x = layers.Reshape((32, 64, first_conv_channels))(x)
+    # x = layers.Add()([image_input_embed, image_input_past_embed])
+    x = layers.Add()([image_input_embed, cross_atte])
+    x = layers.Reshape((32, 32, first_conv_channels))(x)
     
     # time_embedding
     temb = TimeEmbedding(dim=first_conv_channels * 4)(time_input)
@@ -251,6 +251,7 @@ def build_unet_model_c2(img_size_H,
     x = layers.GroupNormalization(groups=norm_groups)(x)
     x = activation_fn(x)
     x = layers.Conv2D(img_channels, (2, 2), padding="same", kernel_initializer=kernel_init(1.0))(x)
+    x = layers.Activation('linear', dtype='float32')(x)
     
     return keras.Model([image_input, time_input,
                         image_input_past1, image_input_past2, 
