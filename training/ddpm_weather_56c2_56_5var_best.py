@@ -10,9 +10,10 @@ import matplotlib.pyplot as plt
 # Requires TensorFlow >=2.11 for the GroupNormalization layer.
 import tensorflow as tf
 from tensorflow import keras
-from tensorflow.keras import layers
+from tensorflow.keras import layers, mixed_precision
 from tensorflow.keras.layers import Input, ConvLSTM2D, BatchNormalization, Conv3D
 from tensorflow.keras.callbacks import *
+mixed_precision.set_global_policy('mixed_float16')
 
 # %%
 import os
@@ -33,7 +34,7 @@ tf.__version__
 # ## Hyperparameters
 
 # %%
-out_name = '/mnt/data/sonia/codicast-out/date/multivar/checkpoints/ddpm3_weather_56c2_56_multivar_cp3'
+out_name = '/mnt/data/sonia/codicast-out/date/multivar/checkpoints/ddpm_onepast_56c2_56_multivar_cp3'
 
 batch_size = 256
 num_epochs = 400         # Just for the sake of demonstration
@@ -84,9 +85,12 @@ from utils.normalization import batch_norm
 # %%
 train_data_tf_norm = batch_norm(train_data_tf, train_data_tf.shape, batch_size=1460)
 
-train_data_tf_norm_pred = train_data_tf_norm[2:]
-train_data_tf_norm_past1 = train_data_tf_norm[:-2]
-train_data_tf_norm_past2 = train_data_tf_norm[1:-1]
+# train_data_tf_norm_pred = train_data_tf_norm[2:]
+# train_data_tf_norm_past1 = train_data_tf_norm[:-2]
+# train_data_tf_norm_past2 = train_data_tf_norm[1:-1]
+train_data_tf_norm_pred = train_data_tf_norm[1:]   # Target starts at 1
+train_data_tf_norm_past1 = train_data_tf_norm[:-1] # Past starts at 0
+train_data_tf_norm_past2 = train_data_tf_norm[:-1] # Past starts at 0
 
 
 print(train_data_tf_norm_pred.shape, train_data_tf_norm_past1.shape, train_data_tf_norm_past2.shape)
@@ -94,9 +98,12 @@ print(train_data_tf_norm_pred.shape, train_data_tf_norm_past1.shape, train_data_
 # %%
 val_data_tf_norm = batch_norm(val_data_tf, val_data_tf.shape, batch_size=1460)
 
-val_data_tf_norm_pred = val_data_tf_norm[2:]
-val_data_tf_norm_past1 = val_data_tf_norm[:-2]
-val_data_tf_norm_past2 = val_data_tf_norm[1:-1]
+# val_data_tf_norm_pred = val_data_tf_norm[2:]
+# val_data_tf_norm_past1 = val_data_tf_norm[:-2]
+# val_data_tf_norm_past2 = val_data_tf_norm[1:-1]
+val_data_tf_norm_pred = val_data_tf_norm[1:]
+val_data_tf_norm_past1 = val_data_tf_norm[:-1]
+val_data_tf_norm_past2 = val_data_tf_norm[:-1]
 
 
 print(val_data_tf_norm_pred.shape, val_data_tf_norm_past1.shape, val_data_tf_norm_past2.shape)
@@ -166,11 +173,11 @@ for layer in pretrained_encoder.layers:
 pretrained_encoder._name = 'encoder'
 
 # %%
-from layers.denoiser import build_unet_model_c2
+from layers.denoiser import build_unet_model_c2_orig
 
 # %%
 # Build the unet model
-network = build_unet_model_c2(
+network = build_unet_model_c2_orig(
     img_size_H=img_size_H,
     img_size_W=img_size_W,
     img_channels=img_channels,
@@ -283,7 +290,7 @@ class DiffusionModel(keras.Model):
 
 
 # Build the unet model
-network = build_unet_model_c2(
+network = build_unet_model_c2_orig(
     img_size_H=img_size_H,
     img_size_W=img_size_W,
     img_channels=img_channels,
@@ -296,7 +303,7 @@ network = build_unet_model_c2(
     encoder=pretrained_encoder,
 )
 
-ema_network = build_unet_model_c2(
+ema_network = build_unet_model_c2_orig(
     img_size_H=img_size_H,
     img_size_W=img_size_W,
     img_channels=img_channels,
@@ -432,7 +439,8 @@ early_stopping_callback = keras.callbacks.EarlyStopping(
 model.compile(
               loss=keras.losses.MeanSquaredError(),
               # loss=lat_weighted_loss_mse_56deg,
-              optimizer=keras.optimizers.Adam(learning_rate=lr_schedule)
+              optimizer=keras.optimizers.Adam(learning_rate=lr_schedule),
+            #   jit_compile=True
              )
 
 # Train the model

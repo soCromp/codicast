@@ -40,8 +40,9 @@ from tqdm import tqdm
 # ## Hyperparameters
 
 # %%
-output_folder = '/mnt/data/sonia/codicast-patch/date/multivar/raw-out1-autoregress/test'
-network_path = '/mnt/data/sonia/codicast-patch/date/multivar/checkpoints/ddpm1_weather_56c2_patch_multivar_cp3/checkpoint'
+name = sys.argv[-1]
+output_folder = f'/mnt/data/sonia/codicast-patch/date/multivar/out-{name}'
+network_path = f'/mnt/data/sonia/codicast-patch/date/multivar/checkpoints/{name}'
 
 batch_size = 1024
 total_timesteps = 1000
@@ -156,7 +157,7 @@ class DiffusionModel(keras.Model):
         return {"loss": loss}
     
 # %%
-# Build the unet model
+# 1. Build the unet models (Do not load weights here!)
 network = build_unet_model_c2(
     img_size_H=img_size_H,
     img_size_W=img_size_W,
@@ -184,21 +185,22 @@ ema_network = build_unet_model_c2(
     encoder=pretrained_encoder,
     interpolation="bilinear"
 )
-network.load_weights(network_path)
-ema_network.set_weights(network.get_weights())  # Initially the weights are the same
 
-# %%
-# Get an instance of the Gaussian Diffusion utilities
+# 2. Get an instance of the Gaussian Diffusion utilities
 gdf_util = GaussianDiffusion(timesteps=total_timesteps)
 
-
-# Get the model
+# 3. Assemble the DiffusionModel Wrapper
 model = DiffusionModel(
     network=network,
     ema_network=ema_network,
     gdf_util=gdf_util,
     timesteps=total_timesteps,
 )
+
+# 4. NOW load the weights into the top-level model
+# .expect_partial() tells Keras not to warn us about missing optimizer weights, 
+# since we aren't compiling the model for training here.
+model.load_weights(network_path).expect_partial()
 
 
 # %% [markdown]
@@ -239,6 +241,9 @@ val_pred, val_past1, val_past2 = \
     load_temporal_triplets('/home/cyclone/train/multivar/0.25/date/satlantic/val')
 test_pred, test_past1, test_past2 = \
     load_temporal_triplets('/home/cyclone/train/multivar/0.25/date/natlantic/test')
+    
+sids = [d for d in os.listdir('/home/cyclone/train/multivar/0.25/date/natlantic/test') \
+    if os.path.isdir(os.path.join('/home/cyclone/train/multivar/0.25/date/natlantic/test', d))]
 
 # Apply Southern Hemisphere V-wind flip if doing it directly in memory
 val_pred = np.flip(val_pred, axis=1)
@@ -291,6 +296,12 @@ from utils.metrics import lat_weighted_rmse_one_var, lat_weighted_acc_one_var
 import tensorflow as tf
 import numpy as np
 
+
+# Force XLA compilation for the inference forward pass
+@tf.function(jit_compile=True)
+def fast_predict_noise(model_ema, samples, tt, past1, past2):
+    return model_ema([samples, tt, past1, past2], training=False)
+
 def generate_images(model, original_samples, original_samples_past1, original_samples_past2, frame_num=None):
     """
     @model: trained denoiser
@@ -311,9 +322,9 @@ def generate_images(model, original_samples, original_samples_past1, original_sa
     # 2. Sample from the model iteratively
     for t in tqdm(reversed(range(0, total_timesteps)), total=total_timesteps, desc=desc, leave=False):
         tt = tf.cast(tf.fill([num_images], t), dtype=tf.int64)
-        pred_noise = model.ema_network([samples, tt, original_samples_past1, original_samples_past2],
-                                               training=False
-                                              )
+        # pred_noise = model.ema_network([samples, tt, original_samples_past1, original_samples_past2],
+        #                                        training=False)
+        pred_noise = fast_predict_noise(model.ema_network, samples, tt, original_samples_past1, original_samples_past2)
         samples = model.gdf_util.p_sample(pred_noise, samples, tt, clip_denoised=True)
         
     # 3. Return generated samples and original samples
@@ -355,7 +366,7 @@ rmse_matrix = np.zeros((num_sample, num_channel, num_lead))
 acc_matrix = np.zeros((num_sample, num_channel, num_lead))
     
     
-inference_batch_size = 64
+inference_batch_size = 512
 
 for z in tqdm(range(0, num_sample, inference_batch_size)):
     # Calculate the current batch size (this prevents errors on the final, smaller batch)
@@ -382,10 +393,10 @@ for z in tqdm(range(0, num_sample, inference_batch_size)):
         # Calculate the actual sample index for saving
         sample_idx = z + b 
         
-        os.makedirs(os.path.join(output_folder, str(sample_idx)), exist_ok=True)
+        os.makedirs(os.path.join(output_folder, sids[sample_idx]), exist_ok=True)
         for t in range(num_lead):
             np.save(
-                os.path.join(output_folder, str(sample_idx), f'{t}.npy'), 
+                os.path.join(output_folder, sids[sample_idx], f'{t}.npy'), 
                 generated_samples_unnormlalized[b, t]
             )
             

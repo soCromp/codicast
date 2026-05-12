@@ -59,36 +59,40 @@ num_res_blocks = 2  # Number of residual blocks
 # ## Dataset
 
 # %%
-def load_temporal_triplets(base_path):
+def load_temporal_triplets_video(base_path, seq_len=8):
     past1_list, past2_list, target_list = [], [], []
     
-    # Find all storm directories
     storm_dirs = [os.path.join(base_path, d) for d in os.listdir(base_path) if os.path.isdir(os.path.join(base_path, d))]
     
     for storm_dir in storm_dirs:
-        # Load all 8 frames for this storm
         frames = []
-        for i in range(8):
+        # Let's assume some storms might have more than 8 frames; load them all
+        num_files = len(glob.glob(os.path.join(storm_dir, "*.npy")))
+        for i in range(num_files):
             filepath = os.path.join(storm_dir, f"{i}.npy")
             if os.path.exists(filepath):
                 frames.append(np.load(filepath))
         
-        # If the storm has all 8 frames, extract sliding windows of 3
-        if len(frames) == 8:
-            for t in range(2, 8):
-                past1_list.append(frames[t-2]) # T-2
-                past2_list.append(frames[t-1]) # T-1
-                target_list.append(frames[t])  # T (The diffusion target)
+        # We need a sliding window that yields: Past2, Past1, and then the next 8 frames
+        # Total needed window size = 2 (past) + 8 (future) = 10
+        if len(frames) >= (2 + seq_len):
+            for t in range(2, len(frames) - seq_len + 1):
+                past1_list.append(frames[t-2])     # T-2
+                past2_list.append(frames[t-1])     # T-1
+                
+                # The target is now a sequence of 8 frames!
+                target_video = np.stack(frames[t : t+seq_len], axis=0)
+                target_list.append(target_video)
                 
     return np.stack(target_list), np.stack(past1_list), np.stack(past2_list)
 
 # Load data (Update paths as needed)
 train_pred, train_past1, train_past2 = \
-    load_temporal_triplets('/home/cyclone/train/multivar/0.25/date/natlantic/train')
+    load_temporal_triplets_video('/home/cyclone/train/multivar/0.25/date/natlantic/train')
 val_pred, val_past1, val_past2 = \
-    load_temporal_triplets('/home/cyclone/train/multivar/0.25/date/satlantic/val')
+    load_temporal_triplets_video('/home/cyclone/train/multivar/0.25/date/satlantic/val')
 test_pred, test_past1, test_past2 = \
-    load_temporal_triplets('/home/cyclone/train/multivar/0.25/date/natlantic/test')
+    load_temporal_triplets_video('/home/cyclone/train/multivar/0.25/date/natlantic/test')
 
 # Apply Southern Hemisphere V-wind flip if doing it directly in memory
 val_pred = np.flip(val_pred, axis=1)
@@ -102,11 +106,6 @@ val_past2[..., v_idx] *= -1
 print(train_pred.shape, train_past1.shape, train_past2.shape)
 
 # %%
-# train_data_tf = train_data_tf.transpose((0, 2, 3, 1))
-# val_data_tf = val_data_tf.transpose((0, 2, 3, 1))
-# test_data_tf = test_data_tf.transpose((0, 2, 3, 1))
-
-# print(train_data_tf.shape, val_data_tf.shape, test_data_tf.shape)
 
 # %% [markdown]
 # ### Preprocessing
@@ -210,11 +209,11 @@ for layer in pretrained_encoder.layers:
 pretrained_encoder._name = 'encoder'
 
 # %%
-from layers.denoiser import build_unet_model_c2
+from layers.denoiser import build_unet_model_c2_3d
 
 # %%
 # Build the unet model
-network = build_unet_model_c2(
+network = build_unet_model_c2_3d(
     img_size_H=img_size_H,
     img_size_W=img_size_W,
     img_channels=img_channels,
@@ -331,7 +330,7 @@ class DiffusionModel(keras.Model):
 
 
 # Build the unet model
-network = build_unet_model_c2(
+network = build_unet_model_c2_3d(
     img_size_H=img_size_H,
     img_size_W=img_size_W,
     img_channels=img_channels,
@@ -345,7 +344,7 @@ network = build_unet_model_c2(
     interpolation="bilinear"
 )
 
-ema_network = build_unet_model_c2(
+ema_network = build_unet_model_c2_3d(
     img_size_H=img_size_H,
     img_size_W=img_size_W,
     img_channels=img_channels,

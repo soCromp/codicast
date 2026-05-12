@@ -54,6 +54,38 @@ class AttentionBlock(layers.Layer):
         proj = tf.einsum("bhwHW,bHWc->bhwc", attn_score, v)
         proj = self.proj(proj)
         return inputs + proj
+    
+    
+class TemporalAttentionBlock(layers.Layer):
+    def __init__(self, channels, num_heads=1, **kwargs):
+        super().__init__(**kwargs)
+        self.channels = channels
+        # Standard Multi-Head Attention operating on the sequence of timeframes
+        self.mha = layers.MultiHeadAttention(num_heads=num_heads, key_dim=channels)
+        
+        # ZERO INITIALIZATION: output = input + 0
+        self.proj = layers.Dense(channels, kernel_initializer='zeros')
+        self.norm = layers.GroupNormalization(groups=8)
+
+    def call(self, x):
+        # Input shape: (Batch, Time, H, W, Channels)
+        shape = tf.shape(x)
+        B, T, H, W, C = shape[0], shape[1], shape[2], shape[3], shape[4]
+
+        # 1. Flatten spatial dimensions so attention only looks across Time
+        # Shape becomes: (Batch * H * W, Time, Channels)
+        x_flat = tf.reshape(x, (B * H * W, T, C))
+
+        # 2. Apply Attention
+        attn = self.mha(query=x_flat, value=x_flat)
+        attn = self.proj(attn)
+
+        # 3. Add residual and reshape back to 5D
+        out = x_flat + attn
+        out = tf.reshape(out, (B, T, H, W, C))
+        
+        # 4. Normalize
+        return self.norm(out)
 
 
 def ResidualBlock(width, groups=8, activation_fn=keras.activations.swish):
@@ -143,6 +175,120 @@ def TimeMLP(units, activation_fn=keras.activations.swish):
     return apply
 
 
+def build_unet_model_c2_orig(img_size_H,
+                     img_size_W,
+                     img_channels,
+                     widths,
+                     has_attention,
+                     num_res_blocks=2,
+                     norm_groups=8,
+                     first_conv_channels=64,
+                     interpolation="nearest",
+                     activation_fn=keras.activations.swish,
+                     encoder=None
+                    ):
+    """
+    define U-Net model
+    """
+    # image_input and time_input
+    image_input = layers.Input(shape=(img_size_H, img_size_W, img_channels), name="image_input")
+    time_input = keras.Input(shape=(), dtype=tf.int64, name="time_input")
+    image_input_past1 = layers.Input(shape=(img_size_H, img_size_W, img_channels), name="image_input_past1")
+    image_input_past2 = layers.Input(shape=(img_size_H, img_size_W, img_channels), name="image_input_past2")
+
+    # ================= image past embedding =================
+    image_input_past_embed1 = encoder(image_input_past1)
+    image_input_past_embed1 = layers.Conv2D(first_conv_channels,
+                                             kernel_size=(3, 3),
+                                             padding="same",
+                                             kernel_initializer=kernel_init(1.0),
+                                            )(image_input_past_embed1)
+    print("image_input_past_embed1 shape:", image_input_past_embed1.shape)
+
+    image_input_past_embed2 = encoder(image_input_past1)
+    image_input_past_embed2 = layers.Conv2D(first_conv_channels,
+                                             kernel_size=(3, 3),
+                                             padding="same",
+                                             kernel_initializer=kernel_init(1.0),
+                                            )(image_input_past_embed2)
+    print("image_input_past_embed2 shape:", image_input_past_embed2.shape)
+
+
+    image_input_past = layers.Concatenate(axis=-1)([image_input_past1, image_input_past2])
+    image_input_past = layers.Conv2D(first_conv_channels,
+                                     kernel_size=(3, 3),
+                                     padding="same",
+                                     kernel_initializer=kernel_init(1.0),
+                                    )(image_input_past)
+    print("image_input_past shape:", image_input_past.shape)
+    
+    image_input_past_embed = layers.Reshape((32*64, first_conv_channels))(image_input_past)
+    print("image_input_past shape:", image_input_past_embed.shape)
+
+
+    
+    # ================= image_embedding =================
+    image_input_embed = layers.Conv2D(first_conv_channels,
+                                      kernel_size=(3, 3),
+                                      padding="same",
+                                      kernel_initializer=kernel_init(1.0),
+                                     )(image_input)
+    image_input_embed = layers.Reshape((32*64, first_conv_channels))(image_input_embed)
+
+    # ================= cross_attention =================
+    cross_atte = layers.MultiHeadAttention(num_heads=1, key_dim=256)(image_input_past_embed, image_input_embed)
+    
+    
+    x = layers.Add()([image_input_embed, image_input_past_embed])
+    x = layers.Add()([x, cross_atte])
+    x = layers.Reshape((32, 64, first_conv_channels))(x)
+    
+    # time_embedding
+    temb = TimeEmbedding(dim=first_conv_channels * 4)(time_input)
+    temb = TimeMLP(units=first_conv_channels * 4, activation_fn=activation_fn)(temb)
+    print("x.shape:", x.shape, "temb.shape:", temb.shape)
+    
+    skips = [x]
+
+    # DownBlock
+    for i in range(len(widths)):
+        for _ in range(num_res_blocks):
+            x = ResidualBlock(widths[i], groups=norm_groups, activation_fn=activation_fn)([x, temb])
+            if has_attention[i]:
+                x = AttentionBlock(widths[i], groups=norm_groups)(x)
+            skips.append(x)
+
+        if widths[i] != widths[-1]:
+            x = DownSample(widths[i])(x)
+            skips.append(x)
+
+    # MiddleBlock
+    x = ResidualBlock(widths[-1], groups=norm_groups, activation_fn=activation_fn)([x, temb])
+    x = AttentionBlock(widths[-1], groups=norm_groups)(x)
+    x = ResidualBlock(widths[-1], groups=norm_groups, activation_fn=activation_fn)([x, temb])
+
+    # UpBlock
+    for i in reversed(range(len(widths))):
+        for _ in range(num_res_blocks + 1):
+            x = layers.Concatenate(axis=-1)([x, skips.pop()])
+            x = ResidualBlock(widths[i], groups=norm_groups, activation_fn=activation_fn)([x, temb])
+            if has_attention[i]:
+                x = AttentionBlock(widths[i], groups=norm_groups)(x)
+
+        if i != 0:
+            x = UpSample(widths[i], interpolation=interpolation)(x)
+
+    # End block
+    x = layers.GroupNormalization(groups=norm_groups)(x)
+    x = activation_fn(x)
+    x = layers.Conv2D(img_channels, (2, 2), padding="same", kernel_initializer=kernel_init(1.0))(x)
+    x = layers.Activation('linear', dtype='float32')(x)
+    
+    return keras.Model([image_input, time_input,
+                        image_input_past1, image_input_past2, 
+                       ], x, name="unet")
+
+
 
 def build_unet_model_c2(img_size_H,
                      img_size_W,
@@ -164,6 +310,129 @@ def build_unet_model_c2(img_size_H,
     time_input = keras.Input(shape=(), dtype=tf.int64, name="time_input")
     image_input_past1 = layers.Input(shape=(img_size_H, img_size_W, img_channels), name="image_input_past1")
     image_input_past2 = layers.Input(shape=(img_size_H, img_size_W, img_channels), name="image_input_past2")
+
+    # ================= image past embedding =================
+    image_input_past_embed1 = encoder(image_input_past1)
+    image_input_past_embed1 = layers.Conv2D(first_conv_channels,
+                                             kernel_size=(3, 3),
+                                             padding="same",
+                                             kernel_initializer=kernel_init(1.0),
+                                            )(image_input_past_embed1)
+    print("image_input_past_embed1 shape:", image_input_past_embed1.shape)
+
+    image_input_past_embed2 = encoder(image_input_past2)
+    image_input_past_embed2 = layers.Conv2D(first_conv_channels,
+                                             kernel_size=(3, 3),
+                                             padding="same",
+                                             kernel_initializer=kernel_init(1.0),
+                                            )(image_input_past_embed2)
+    print("image_input_past_embed2 shape:", image_input_past_embed2.shape)
+
+
+    image_input_past_latent = layers.Concatenate(axis=-1)([image_input_past_embed1, image_input_past_embed2])
+    image_input_past_latent = layers.Conv2D(first_conv_channels,
+                                     kernel_size=(3, 3),
+                                     padding="same",
+                                     kernel_initializer=kernel_init(1.0),
+                                    )(image_input_past_latent)
+    print("image_input_past_latent shape:", image_input_past_latent.shape)
+    
+    image_input_past_embed = layers.Reshape((64, first_conv_channels))(image_input_past_latent)
+    print("image_input_past shape:", image_input_past_embed.shape)
+
+
+    
+    # ================= image_embedding =================
+    image_input_embed = layers.Conv2D(first_conv_channels,
+                                      kernel_size=(3, 3),
+                                      padding="same",
+                                      kernel_initializer=kernel_init(1.0),
+                                     )(image_input)
+    image_input_embed = layers.Reshape((1024, first_conv_channels))(image_input_embed)
+
+    # ================= cross_attention =================
+    cross_atte = layers.MultiHeadAttention(num_heads=1, key_dim=256)(image_input_embed, image_input_past_embed)
+    
+    
+    # x = layers.Add()([image_input_embed, image_input_past_embed])
+    x = layers.Add()([image_input_embed, cross_atte])
+    x = layers.Reshape((32, 32, first_conv_channels))(x)
+    
+    # time_embedding
+    temb = TimeEmbedding(dim=first_conv_channels * 4)(time_input)
+    temb = TimeMLP(units=first_conv_channels * 4, activation_fn=activation_fn)(temb)
+    print("x.shape:", x.shape, "temb.shape:", temb.shape)
+    
+    skips = [x]
+
+    # DownBlock
+    for i in range(len(widths)):
+        for _ in range(num_res_blocks):
+            x = ResidualBlock(widths[i], groups=norm_groups, activation_fn=activation_fn)([x, temb])
+            if has_attention[i]:
+                x = AttentionBlock(widths[i], groups=norm_groups)(x)
+            skips.append(x)
+
+        if widths[i] != widths[-1]:
+            x = DownSample(widths[i])(x)
+            skips.append(x)
+
+    # MiddleBlock
+    x = ResidualBlock(widths[-1], groups=norm_groups, activation_fn=activation_fn)([x, temb])
+    x = AttentionBlock(widths[-1], groups=norm_groups)(x)
+    x = ResidualBlock(widths[-1], groups=norm_groups, activation_fn=activation_fn)([x, temb])
+
+    # UpBlock
+    for i in reversed(range(len(widths))):
+        for _ in range(num_res_blocks + 1):
+            x = layers.Concatenate(axis=-1)([x, skips.pop()])
+            x = ResidualBlock(widths[i], groups=norm_groups, activation_fn=activation_fn)([x, temb])
+            if has_attention[i]:
+                x = AttentionBlock(widths[i], groups=norm_groups)(x)
+
+        if i != 0:
+            x = UpSample(widths[i], interpolation=interpolation)(x)
+
+    # End block
+    x = layers.GroupNormalization(groups=norm_groups)(x)
+    x = activation_fn(x)
+    x = layers.Conv2D(img_channels, (2, 2), padding="same", kernel_initializer=kernel_init(1.0))(x)
+    x = layers.Activation('linear', dtype='float32')(x)
+    
+    return keras.Model([image_input, time_input,
+                        image_input_past1, image_input_past2, 
+                       ], x, name="unet")
+
+
+
+def build_unet_model_c2_3d(img_size_H,
+                     img_size_W,
+                     img_channels,
+                     widths,
+                     has_attention,
+                     num_res_blocks=2,
+                     norm_groups=8,
+                     first_conv_channels=64,
+                     interpolation="nearest",
+                     activation_fn=keras.activations.swish,
+                     encoder=None
+                    ):
+    """
+    define U-Net model
+    """
+    # image_input and time_input
+    image_input = layers.Input(shape=(seq_len, img_size_H, img_size_W, img_channels), name="image_input")
+    time_input = keras.Input(shape=(), dtype=tf.int64, name="time_input")
+    
+    image_input_past1 = layers.Input(shape=(img_size_H, img_size_W, img_channels), name="image_input_past1")
+    image_input_past2 = layers.Input(shape=(img_size_H, img_size_W, img_channels), name="image_input_past2")
+    
+    B = tf.shape(image_input)[0]
+    T = seq_len
+    
+    
+    # Fold Time into Batch: (Batch*8, 32, 32, 5)
+    x_spatial = tf.reshape(image_input, (B * T, img_size_H, img_size_W, img_channels))
 
     # ================= image past embedding =================
     image_input_past_embed1 = encoder(image_input_past1)
