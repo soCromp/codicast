@@ -405,7 +405,8 @@ def build_unet_model_c2(img_size_H,
 
 
 
-def build_unet_model_c2_3d(img_size_H,
+def build_unet_model_c2_3d(seq_len,
+                     img_size_H,
                      img_size_W,
                      img_channels,
                      widths,
@@ -432,7 +433,12 @@ def build_unet_model_c2_3d(img_size_H,
     
     
     # Fold Time into Batch: (Batch*8, 32, 32, 5)
-    x_spatial = tf.reshape(image_input, (B * T, img_size_H, img_size_W, img_channels))
+    x_spatial = tf.reshape(image_input, [-1, img_size_H, img_size_W, img_channels])
+    x_spatial.set_shape([None, img_size_H, img_size_W, img_channels])
+    
+    # Repeat the diffusion timestep for all 8 frames
+    t_spatial = tf.repeat(time_input, repeats=T, axis=0)
+    t_spatial.set_shape([None])
 
     # ================= image past embedding =================
     image_input_past_embed1 = encoder(image_input_past1)
@@ -461,8 +467,9 @@ def build_unet_model_c2_3d(img_size_H,
     print("image_input_past_latent shape:", image_input_past_latent.shape)
     
     image_input_past_embed = layers.Reshape((64, first_conv_channels))(image_input_past_latent)
+    image_input_past_embed = tf.repeat(image_input_past_embed, repeats=T, axis=0) # broadcasts to the 8 video frames
+    image_input_past_embed.set_shape([None, 64, first_conv_channels])
     print("image_input_past shape:", image_input_past_embed.shape)
-
 
     
     # ================= image_embedding =================
@@ -470,7 +477,7 @@ def build_unet_model_c2_3d(img_size_H,
                                       kernel_size=(3, 3),
                                       padding="same",
                                       kernel_initializer=kernel_init(1.0),
-                                     )(image_input)
+                                     )(x_spatial)
     image_input_embed = layers.Reshape((1024, first_conv_channels))(image_input_embed)
 
     # ================= cross_attention =================
@@ -482,7 +489,7 @@ def build_unet_model_c2_3d(img_size_H,
     x = layers.Reshape((32, 32, first_conv_channels))(x)
     
     # time_embedding
-    temb = TimeEmbedding(dim=first_conv_channels * 4)(time_input)
+    temb = TimeEmbedding(dim=first_conv_channels * 4)(t_spatial)
     temb = TimeMLP(units=first_conv_channels * 4, activation_fn=activation_fn)(temb)
     print("x.shape:", x.shape, "temb.shape:", temb.shape)
     
@@ -503,6 +510,16 @@ def build_unet_model_c2_3d(img_size_H,
     # MiddleBlock
     x = ResidualBlock(widths[-1], groups=norm_groups, activation_fn=activation_fn)([x, temb])
     x = AttentionBlock(widths[-1], groups=norm_groups)(x)
+    
+    # temporal attention. Unfold back to video: (B, T, H/x, W/x, C)
+    _, h, w, c = x.shape
+    x_video = tf.reshape(x, [-1, T, h, w, c])
+    x_video.set_shape([None, T, h, w, c])
+    x_video = TemporalAttentionBlock(channels=widths[-1])(x_video)
+    # Fold back to spatial for the remaining blocks
+    x = tf.reshape(x_video, [-1, h, w, c])
+    x.set_shape([None, h, w, c])
+    
     x = ResidualBlock(widths[-1], groups=norm_groups, activation_fn=activation_fn)([x, temb])
 
     # UpBlock
@@ -520,6 +537,10 @@ def build_unet_model_c2_3d(img_size_H,
     x = layers.GroupNormalization(groups=norm_groups)(x)
     x = activation_fn(x)
     x = layers.Conv2D(img_channels, (2, 2), padding="same", kernel_initializer=kernel_init(1.0))(x)
+    
+    # final unfold - turn output into video 
+    x = tf.reshape(x, [-1, T, img_size_H, img_size_W, img_channels])
+    x.set_shape([None, T, img_size_H, img_size_W, img_channels])
     x = layers.Activation('linear', dtype='float32')(x)
     
     return keras.Model([image_input, time_input,

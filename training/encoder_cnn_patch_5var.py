@@ -2,6 +2,23 @@
 import os
 import sys
 
+# 1. Hardcode your Conda prefix (since we know where it lives on fred-desktop-2)
+conda_prefix = '/hdd2/sonia/miniconda3/envs/codicast'
+
+# 2. Force the system to look here for the NVIDIA libraries
+os.environ['LD_LIBRARY_PATH'] = (
+    f"{conda_prefix}/lib/python3.10/site-packages/nvidia/cudnn/lib:"
+    f"{conda_prefix}/lib/python3.10/site-packages/nvidia/cuda_runtime/lib:"
+    f"{conda_prefix}/lib/python3.10/site-packages/nvidia/cublas/lib:"
+    f"{conda_prefix}/lib:" + os.environ.get('LD_LIBRARY_PATH', '')
+)
+
+# 3. Pin to GPU
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+
+gpus = tf.config.list_physical_devices('GPU')
+print("Found GPUs:", gpus)
+
 module_path = os.path.abspath(os.path.join('..'))
 if module_path not in sys.path:
     sys.path.append(module_path)
@@ -26,16 +43,24 @@ from tensorflow.keras.callbacks import *
 from tensorflow.keras import mixed_precision
 mixed_precision.set_global_policy('mixed_float16')
 
+gpus = tf.config.list_physical_devices('GPU')
+print("GPUS", gpus)
+if gpus:
+    try:
+        for gpu in gpus:
+            tf.config.experimental.set_memory_growth(gpu, True)
+        print("Memory growth enabled")
+    except RuntimeError as e:
+        print(e)
+        
+# tf.debugging.set_log_device_placement(True)
+
 from utils.preprocess import batch_norm, batch_norm_inverse
 from utils.patch_normalization import KerasHybridNormalizer
 from utils.visuals import vis_one_var_recon
 from utils.metrics import lat_weighted_rmse_one_var
 
 import glob
-
-# %%
-import os
-os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 
 # %% [markdown]
 # ### Data
@@ -53,10 +78,10 @@ def load_patch_data(base_path):
     # Stack into a single array (N_samples, 32, 32, 5)
     return np.stack(data_list)
 
-path = '/home/cyclone/train/multivar/0.25/date/natlantic'
+path = '/hdd3/sonia/cyclone/multivar/natlantic'
 X_train = load_patch_data(os.path.join(path, 'train'))
 
-X_val = load_patch_data('/home/cyclone/train/multivar/0.25/date/satlantic/train')
+X_val = load_patch_data('/hdd3/sonia/cyclone/multivar/satlantic/train')
 X_val = np.flip(X_val, axis=1) 
 v_idx = 2 # Update this index if v10 is not at index 2!
 X_val[..., v_idx] *= -1
@@ -151,20 +176,43 @@ mc = ModelCheckpoint('../saved_models/encoder_cnn_patch_multivar.h5',
 
 BATCH_SIZE = 512
 
-train_dataset = tf.data.Dataset.from_tensor_slices((X_train_norm, X_train_norm))
-train_dataset = train_dataset.shuffle(buffer_size=10000).batch(BATCH_SIZE).prefetch(tf.data.AUTOTUNE)
+# 1. Clear up raw data to free RAM immediately
+del X_train
+del X_test
+import gc
+gc.collect()
 
-val_dataset = tf.data.Dataset.from_tensor_slices((X_val_norm, X_val_norm))
-val_dataset = val_dataset.batch(BATCH_SIZE).prefetch(tf.data.AUTOTUNE)
+# 2. Use a generator to feed the dataset without copying the array
+def data_generator(data):
+    for sample in data:
+        # For an autoencoder, yield the same sample as (input, target)
+        yield sample, sample
 
+# 3. Create the dataset from the generator
+output_signature = (
+    tf.TensorSpec(shape=(32, 32, 5), dtype=tf.float32),
+    tf.TensorSpec(shape=(32, 32, 5), dtype=tf.float32)
+)
+
+train_dataset = tf.data.Dataset.from_generator(
+    lambda: data_generator(X_train_norm),
+    output_signature=output_signature
+)
+
+# Optimization: Shuffle and Batch
+train_dataset = train_dataset.shuffle(buffer_size=1000).batch(BATCH_SIZE).prefetch(tf.data.AUTOTUNE)
+
+# Repeat for validation
+val_dataset = tf.data.Dataset.from_generator(
+    lambda: data_generator(X_val_norm),
+    output_signature=output_signature
+).batch(BATCH_SIZE).prefetch(tf.data.AUTOTUNE)
+
+# Now fit
 model.fit(train_dataset, 
           validation_data=val_dataset,
           epochs=100, 
-          batch_size=512,
-          # verbose=2,
-          shuffle=True,
-          callbacks=[es, mc]
-         )
+          callbacks=[es, mc])
 
 # %% [markdown]
 

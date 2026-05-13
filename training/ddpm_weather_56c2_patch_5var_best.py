@@ -6,6 +6,8 @@ import math
 import numpy as np
 import matplotlib.pyplot as plt
 import glob
+import os
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 
 # %%
 # Requires TensorFlow >=2.11 for the GroupNormalization layer.
@@ -25,10 +27,6 @@ if module_path not in sys.path:
     sys.path.append(module_path)
 
 # %%
-import os
-os.environ["CUDA_VISIBLE_DEVICES"] = "0"
-
-# %%
 tf.__version__
 
 # %% [markdown]
@@ -36,7 +34,7 @@ tf.__version__
 
 # %%
 out_fname = sys.argv[-2]
-out_name = f'/mnt/data/sonia/codicast-patch/date/multivar/checkpoints/{out_fname}'
+out_name = f'../saved_models/codicast-patch/date/multivar/checkpoints/{out_fname}'
 print('will save to', out_name)
 
 batch_size = 256
@@ -82,13 +80,13 @@ def load_temporal_triplets(base_path):
                 
     return np.stack(target_list), np.stack(past1_list), np.stack(past2_list)
 
-# Load data (Update paths as needed)
+# Load data 
 train_pred, train_past1, train_past2 = \
-    load_temporal_triplets('/home/cyclone/train/multivar/0.25/date/natlantic/train')
+    load_temporal_triplets('/hdd3/sonia/cyclone/multivar/natlantic/train')
 val_pred, val_past1, val_past2 = \
-    load_temporal_triplets('/home/cyclone/train/multivar/0.25/date/satlantic/val')
+    load_temporal_triplets('/hdd3/sonia/cyclone/multivar/satlantic/train')
 test_pred, test_past1, test_past2 = \
-    load_temporal_triplets('/home/cyclone/train/multivar/0.25/date/natlantic/test')
+    load_temporal_triplets('/hdd3/sonia/cyclone/multivar/natlantic/test')
 
 # Apply Southern Hemisphere V-wind flip if doing it directly in memory
 val_pred = np.flip(val_pred, axis=1)
@@ -176,7 +174,7 @@ from layers.diffusion import GaussianDiffusion
 # %%
 from tensorflow.keras.models import load_model
 
-pretrained_encoder_full = load_model('../saved_models/encoder_cnn_patch_multivar.h5')
+pretrained_encoder_full = load_model('../saved_models/debug_encoder_cnn_patch_multivar.h5')
 pretrained_encoder_full.summary()
 
 # %%
@@ -263,6 +261,10 @@ class DiffusionModel(keras.Model):
         # Unpack the data
         (images, image_input_past1, image_input_past2), y = data
         
+        images = tf.cast(images, tf.float32)
+        image_input_past1 = tf.cast(image_input_past1, tf.float32)
+        image_input_past2 = tf.cast(image_input_past2, tf.float32)
+        
         # 1. Get the batch size
         batch_size = tf.shape(images)[0]
         
@@ -271,7 +273,7 @@ class DiffusionModel(keras.Model):
 
         with tf.GradientTape() as tape:
             # 3. Sample random noise to be added to the images in the batch
-            noise = tf.random.normal(shape=tf.shape(images), dtype=images.dtype)
+            noise = tf.random.normal(shape=tf.shape(images), dtype=tf.float32)
             # print("noise.shape:", noise.shape)
             
             # 4. Diffuse the images with noise
@@ -306,6 +308,10 @@ class DiffusionModel(keras.Model):
     def test_step(self, data):
         # Unpack the data
         (images, image_input_past1, image_input_past2), y = data
+        
+        images = tf.cast(images, tf.float32)
+        image_input_past1 = tf.cast(image_input_past1, tf.float32)
+        image_input_past2 = tf.cast(image_input_past2, tf.float32)
 
         # 1. Get the batch size
         batch_size = tf.shape(images)[0]
@@ -314,7 +320,7 @@ class DiffusionModel(keras.Model):
         t = tf.random.uniform(minval=0, maxval=self.timesteps, shape=(batch_size,), dtype=tf.int64)
 
         # 3. Sample random noise to be added to the images in the batch
-        noise = tf.random.normal(shape=tf.shape(images), dtype=images.dtype)
+        noise = tf.random.normal(shape=tf.shape(images), dtype=tf.float32)
         
         # 4. Diffuse the images with noise
         images_t = self.gdf_util.q_sample(images, t, noise)
@@ -370,11 +376,11 @@ ema_network.set_weights(network.get_weights())  # Initially the weights are the 
 train_dataset = tf.data.Dataset.from_tensor_slices(
     ((train_norm_pred, train_norm_past1, train_norm_past2), train_norm_pred)
 )
-train_dataset = train_dataset.shuffle(buffer_size=10000).batch(batch_size).prefetch(tf.data.AUTOTUNE)
+train_dataset = train_dataset.shuffle(buffer_size=10000).batch(batch_size, drop_remainder=True).prefetch(tf.data.AUTOTUNE)
 
 val_dataset = tf.data.Dataset.from_tensor_slices(
     ((val_norm_pred, val_norm_past1, val_norm_past2), val_norm_pred)
-).batch(batch_size).prefetch(tf.data.AUTOTUNE)
+).batch(batch_size, drop_remainder=True).prefetch(tf.data.AUTOTUNE)
 
 # %%
 # from loss.loss import lat_weighted_loss_mse_56deg

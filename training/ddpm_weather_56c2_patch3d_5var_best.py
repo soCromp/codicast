@@ -36,10 +36,10 @@ tf.__version__
 
 # %%
 out_fname = sys.argv[-2]
-out_name = f'/mnt/data/sonia/codicast-patch/date/multivar/checkpoints/{out_fname}'
+out_name = f'/hdd3/sonia/codicast/saved_models/3d_checkpoints/{out_fname}'
 print('will save to', out_name)
 
-batch_size = 256
+batch_size = 128
 num_epochs = 400         # Just for the sake of demonstration
 total_timesteps = 1000   # 1000
 norm_groups = 8          # Number of groups used in GroupNormalization layer
@@ -48,6 +48,7 @@ learning_rate = float(sys.argv[-1])
 img_size_H = 32
 img_size_W = 32
 img_channels = 5
+seq_len = 6
 
 first_conv_channels = 64
 channel_multiplier = [1, 2, 4, 8]
@@ -63,11 +64,13 @@ def load_temporal_triplets_video(base_path, seq_len=8):
     past1_list, past2_list, target_list = [], [], []
     
     storm_dirs = [os.path.join(base_path, d) for d in os.listdir(base_path) if os.path.isdir(os.path.join(base_path, d))]
+    # print(storm_dirs)
     
     for storm_dir in storm_dirs:
         frames = []
         # Let's assume some storms might have more than 8 frames; load them all
         num_files = len(glob.glob(os.path.join(storm_dir, "*.npy")))
+        # print(num_files)
         for i in range(num_files):
             filepath = os.path.join(storm_dir, f"{i}.npy")
             if os.path.exists(filepath):
@@ -86,13 +89,12 @@ def load_temporal_triplets_video(base_path, seq_len=8):
                 
     return np.stack(target_list), np.stack(past1_list), np.stack(past2_list)
 
-# Load data (Update paths as needed)
 train_pred, train_past1, train_past2 = \
-    load_temporal_triplets_video('/home/cyclone/train/multivar/0.25/date/natlantic/train')
+    load_temporal_triplets_video('/hdd3/sonia/cyclone/multivar/natlantic/train', seq_len=seq_len)
 val_pred, val_past1, val_past2 = \
-    load_temporal_triplets_video('/home/cyclone/train/multivar/0.25/date/satlantic/val')
+    load_temporal_triplets_video('/hdd3/sonia/cyclone/multivar/satlantic/train', seq_len=seq_len)
 test_pred, test_past1, test_past2 = \
-    load_temporal_triplets_video('/home/cyclone/train/multivar/0.25/date/natlantic/test')
+    load_temporal_triplets_video('/hdd3/sonia/cyclone/multivar/natlantic/test', seq_len=seq_len)
 
 # Apply Southern Hemisphere V-wind flip if doing it directly in memory
 val_pred = np.flip(val_pred, axis=1)
@@ -214,6 +216,7 @@ from layers.denoiser import build_unet_model_c2_3d
 # %%
 # Build the unet model
 network = build_unet_model_c2_3d(
+    seq_len=seq_len,
     img_size_H=img_size_H,
     img_size_W=img_size_W,
     img_channels=img_channels,
@@ -259,78 +262,78 @@ class DiffusionModel(keras.Model):
         self.ema = ema
 
     def train_step(self, data):
-        # Unpack the data
         (images, image_input_past1, image_input_past2), y = data
         
-        # 1. Get the batch size
-        batch_size = tf.shape(images)[0]
+        # Dynamically get shapes
+        shape = tf.shape(images)
+        B, T, H, W, C = shape[0], shape[1], shape[2], shape[3], shape[4]
         
-        # 2. Sample timesteps uniformly
-        t = tf.random.uniform(minval=0, maxval=self.timesteps, shape=(batch_size,), dtype=tf.int64)
+        # Sample timesteps uniformly (One timestep per video)
+        t = tf.random.uniform(minval=0, maxval=self.timesteps, shape=(B,), dtype=tf.int64)
 
         with tf.GradientTape() as tape:
-            # 3. Sample random noise to be added to the images in the batch
-            noise = tf.random.normal(shape=tf.shape(images), dtype=images.dtype)
-            # print("noise.shape:", noise.shape)
+            # Sample random noise 
+            noise = tf.random.normal(shape=shape, dtype=images.dtype)
             
-            # 4. Diffuse the images with noise
-            images_t = self.gdf_util.q_sample(images, t, noise)
-            # print("images_t.shape:", images_t.shape)
+            # --- THE 4D DIFFUSION FOLD ---
+            images_folded = tf.reshape(images, [-1, H, W, C])
+            noise_folded = tf.reshape(noise, [-1, H, W, C])
+            t_folded = tf.repeat(t, repeats=T, axis=0)
             
-            # 5. Pass the diffused images and time steps to the network
+            # Diffuse the folded 4D images
+            images_t_folded = self.gdf_util.q_sample(images_folded, t_folded, noise_folded)
+            
+            # Unfold back to 5D video
+            images_t = tf.reshape(images_t_folded, [-1, T, H, W, C])
+            # -----------------------------
+            
+            # Pass the diffused images and time steps to the network
             pred_noise = self.network([images_t, t, image_input_past1, image_input_past2], training=True)
-            # print("pred_noise.shape:", pred_noise.shape)
             
-            # 6. Calculate the loss
+            # Calculate the loss
             loss = self.loss(noise, pred_noise)
-            
-            # Scale the loss to prevent float16 underflow
             scaled_loss = self.optimizer.get_scaled_loss(loss)
 
-        # 7. Get the gradients
+        # Get the gradients and apply
         scaled_gradients = tape.gradient(scaled_loss, self.network.trainable_weights)
-        gradients = self.optimizer.get_unscaled_gradients(scaled_gradients) # unscale
-
-        # 8. Update the weights of the network
+        gradients = self.optimizer.get_unscaled_gradients(scaled_gradients)
         self.optimizer.apply_gradients(zip(gradients, self.network.trainable_weights))
 
-        # 9. Updates the weight values for the network with EMA weights
+        # Update EMA weights
         for weight, ema_weight in zip(self.network.weights, self.ema_network.weights):
             ema_weight.assign(self.ema * ema_weight + (1 - self.ema) * weight)
 
-        # 10. Return loss values
         return {"loss": loss}
 
     
     def test_step(self, data):
-        # Unpack the data
         (images, image_input_past1, image_input_past2), y = data
 
-        # 1. Get the batch size
-        batch_size = tf.shape(images)[0]
+        shape = tf.shape(images)
+        B, T, H, W, C = shape[0], shape[1], shape[2], shape[3], shape[4]
         
-        # 2. Sample timesteps uniformly
-        t = tf.random.uniform(minval=0, maxval=self.timesteps, shape=(batch_size,), dtype=tf.int64)
-
-        # 3. Sample random noise to be added to the images in the batch
-        noise = tf.random.normal(shape=tf.shape(images), dtype=images.dtype)
+        t = tf.random.uniform(minval=0, maxval=self.timesteps, shape=(B,), dtype=tf.int64)
+        noise = tf.random.normal(shape=shape, dtype=images.dtype)
         
-        # 4. Diffuse the images with noise
-        images_t = self.gdf_util.q_sample(images, t, noise)
+        # --- THE 4D DIFFUSION FOLD ---
+        images_folded = tf.reshape(images, [-1, H, W, C])
+        noise_folded = tf.reshape(noise, [-1, H, W, C])
+        t_folded = tf.repeat(t, repeats=T, axis=0)
         
-        # 5. Pass the diffused images and time steps to the network
+        images_t_folded = self.gdf_util.q_sample(images_folded, t_folded, noise_folded)
+        images_t = tf.reshape(images_t_folded, [-1, T, H, W, C])
+        # -----------------------------
+        
         pred_noise = self.network([images_t, t, image_input_past1, image_input_past2], training=False)
-        
-        # 6. Calculate the loss
         loss = self.loss(noise, pred_noise)
 
-        # 7. Return loss values
         return {"loss": loss}
 
 
 
 # Build the unet model
 network = build_unet_model_c2_3d(
+    seq_len=seq_len,
     img_size_H=img_size_H,
     img_size_W=img_size_W,
     img_channels=img_channels,
@@ -345,6 +348,7 @@ network = build_unet_model_c2_3d(
 )
 
 ema_network = build_unet_model_c2_3d(
+    seq_len=seq_len,
     img_size_H=img_size_H,
     img_size_W=img_size_W,
     img_channels=img_channels,
@@ -357,7 +361,23 @@ ema_network = build_unet_model_c2_3d(
     encoder=pretrained_encoder,
     interpolation="bilinear"
 )
-ema_network.set_weights(network.get_weights())  # Initially the weights are the same
+
+# 1. Get an instance of the Gaussian Diffusion utilities
+gdf_util = GaussianDiffusion(timesteps=total_timesteps)
+
+
+network.load_weights('../saved_models/codicast-patch/date/multivar/checkpoints/patch_2d_debug_clean.h5', by_name=True, skip_mismatch=True)
+ema_network.set_weights(network.get_weights())
+
+
+
+# 2. Get the model wrapper
+model = DiffusionModel(
+    network=network,
+    ema_network=ema_network,
+    gdf_util=gdf_util,
+    timesteps=total_timesteps,
+)
 
 # %%
 # ema_network.summary()
@@ -382,18 +402,6 @@ val_dataset = tf.data.Dataset.from_tensor_slices(
 learning_rate = 1e-4
 decay_steps = 10000
 decay_rate = 0.95
-
-
-# Get an instance of the Gaussian Diffusion utilities
-gdf_util = GaussianDiffusion(timesteps=total_timesteps)
-
-# Get the model
-model = DiffusionModel(
-    network=network,
-    ema_network=ema_network,
-    gdf_util=gdf_util,
-    timesteps=total_timesteps,
-)
 
 # %%
 lr_schedule = keras.optimizers.schedules.ExponentialDecay(initial_learning_rate=learning_rate, 
