@@ -9,9 +9,10 @@ import matplotlib.pyplot as plt
 # Requires TensorFlow >=2.11 for the GroupNormalization layer.
 import tensorflow as tf
 from tensorflow import keras
-from tensorflow.keras import layers
+from tensorflow.keras import layers, mixed_precision
 from tensorflow.keras.layers import Input, ConvLSTM2D, BatchNormalization, Conv3D
 from tensorflow.keras.callbacks import *
+mixed_precision.set_global_policy('mixed_float16')
 
 import os
 import sys
@@ -119,11 +120,11 @@ for layer in pretrained_encoder.layers:
 pretrained_encoder._name = 'encoder'
 
 # %%
-from layers.denoiser import build_unet_model_c2, build_unet_model_c2_no_cross_attn, build_unet_model_c2_no_encoder, build_unet_model_c2_no_cross_attn_encoder
+from layers.denoiser import build_unet_model_c2_orig#, build_unet_model_c2_no_cross_attn, build_unet_model_c2_no_encoder, build_unet_model_c2_no_cross_attn_encoder
 
 # %%
 # Build the unet model
-network = build_unet_model_c2(
+network = build_unet_model_c2_orig(
     img_size_H=img_size_H,
     img_size_W=img_size_W,
     img_channels=img_channels,
@@ -222,7 +223,7 @@ class DiffusionModel(keras.Model):
 
 # %%
 # Build the unet model
-network = build_unet_model_c2(
+network = build_unet_model_c2_orig(
     img_size_H=img_size_H,
     img_size_W=img_size_W,
     img_channels=img_channels,
@@ -235,7 +236,7 @@ network = build_unet_model_c2(
     encoder=pretrained_encoder,
 )
 
-ema_network = build_unet_model_c2(
+ema_network = build_unet_model_c2_orig(
     img_size_H=img_size_H,
     img_size_W=img_size_W,
     img_channels=img_channels,
@@ -263,7 +264,7 @@ model = DiffusionModel(
 
 # %%
 ## -------------------- ablation study --------------------
-model.load_weights('/mnt/data/sonia/codicast-out/date/multivar/checkpoints/ddpm3_weather_56c2_56_multivar_cp3')  # CoDiCast with 1000 steps
+model.load_weights('/mnt/data/sonia/codicast-out/date/multivar/checkpoints/ddpm_onepast_56c2_56_multivar_cp3')  # CoDiCast with 1000 steps
 # model.load_weights('../checkpoints/ddpm_weather_56c2_56_5var_cp3_no_cross_attn')
 # model.load_weights('../checkpoints/ddpm_weather_56c2_56_5var_cp3_no_encoder')
 # model.load_weights('../checkpoints/ddpm_weather_56c2_56_5var_cp3_no_cross_attn_encoder')
@@ -283,7 +284,7 @@ resolution_folder = '56degree'
 resolution = '5.625'  
 var_num = '5'
 
-output_folder = '/mnt/data/sonia/codicast-out/date/multivar/raw-out3/test'
+output_folder = '/mnt/data/sonia/codicast-out/date/multivar/raw-out-onepast/test'
 
 # test_data_tf = np.load("/mnt/data/sonia/codicast-data/default/concat_2017_2018_" + resolution + "_" + var_num + "var.npy")
 test_data_tf = np.load("/mnt/data/sonia/codicast-data/multivar/concat_2016_2024_" + resolution + "_" + var_num + "var.npy")
@@ -295,9 +296,9 @@ test_data_tf_norm = batch_norm(test_data_tf, test_data_tf.shape, batch_size=1460
 test_data_tf_norm.shape
 
 # %%
-test_data_tf_norm_pred = test_data_tf_norm[2:]
-test_data_tf_norm_past1 = test_data_tf_norm[:-2]
-test_data_tf_norm_past2 = test_data_tf_norm[1:-1]
+test_data_tf_norm_pred = test_data_tf_norm[1:]
+test_data_tf_norm_past1 = test_data_tf_norm[:-1]
+test_data_tf_norm_past2 = test_data_tf_norm[:-1]
 
 print(test_data_tf_norm_pred.shape, test_data_tf_norm_past1.shape, test_data_tf_norm_past2.shape)
 
@@ -424,7 +425,7 @@ acc_matrix = np.zeros((num_sample, num_channel, num_lead))
 #         np.save(os.path.join(output_folder, str(z), f'{t}.npy'), generated_samples_unnormlalized[t])
     
     
-inference_batch_size = 64
+inference_batch_size = 512
 
 for z in tqdm(range(0, num_sample, inference_batch_size)):
     # Calculate the current batch size (this prevents errors on the final, smaller batch)

@@ -215,7 +215,7 @@ def load_temporal_triplets(base_path):
     past1_list, past2_list, target_list = [], [], []
     
     # Find all storm directories
-    storm_dirs = [os.path.join(base_path, d) for d in os.listdir(base_path) if os.path.isdir(os.path.join(base_path, d))]
+    storm_dirs = sorted([os.path.join(base_path, d) for d in os.listdir(base_path) if os.path.isdir(os.path.join(base_path, d))])
     
     for storm_dir in storm_dirs:
         # Load all 8 frames for this storm
@@ -242,8 +242,8 @@ val_pred, val_past1, val_past2 = \
 test_pred, test_past1, test_past2 = \
     load_temporal_triplets('/home/cyclone/train/multivar/0.25/date/natlantic/test')
     
-sids = [d for d in os.listdir('/home/cyclone/train/multivar/0.25/date/natlantic/test') \
-    if os.path.isdir(os.path.join('/home/cyclone/train/multivar/0.25/date/natlantic/test', d))]
+sids = sids([d for d in os.listdir('/home/cyclone/train/multivar/0.25/date/natlantic/test') \
+    if os.path.isdir(os.path.join('/home/cyclone/train/multivar/0.25/date/natlantic/test', d))])
 
 # Apply Southern Hemisphere V-wind flip if doing it directly in memory
 val_pred = np.flip(val_pred, axis=1)
